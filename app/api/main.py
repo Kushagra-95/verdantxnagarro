@@ -104,6 +104,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request.state.environment = env
         request.state.is_admin = bool(roles.intersection({"platform_admin", "client_admin"}))
         request.state.assigned_project = env["project_name"] if not request.state.is_admin else None
+        request.state.view = directory.get_project_view(env["project_id"])
         service = directory.service(env)
         return service, service.store, service.settings
 
@@ -140,13 +141,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service, store, settings = workspace(request, "view")
         if request.state.assigned_project:
             project = request.state.assigned_project
+        view = request.state.view
+        allowed_zones = view.get("allowed_zones", [])
         with store.lock:
             all_jobs = store.jobs()
+            if allowed_zones:
+                all_jobs = [j for j in all_jobs if j.zone in allowed_zones]
             jobs = [j for j in all_jobs if not project or j.project == project]
-            return {"workspace": request.state.environment, "user": request.state.user, "clock": service.now, "run_id": store.get("run_id"), "zones": ZONES,
+            zones = {k: v for k, v in ZONES.items() if not allowed_zones or k in allowed_zones}
+            replay_data = store.get("replay") if "replay" in view.get("visible_sections", []) else None
+            return {"workspace": request.state.environment, "user": request.state.user, "clock": service.now, "run_id": store.get("run_id"), "zones": zones,
                     "projects": sorted({j.project for j in all_jobs}), "selected_project": project,
-                    "jobs": jobs, "report": service.report_for(jobs), "replay": store.get("replay"),
+                    "jobs": jobs, "report": service.report_for(jobs), "replay": replay_data,
                     "pending_approvals": sum(j.status == "needs_approval" for j in jobs),
+                    "view": view,
                     "config": {"pue": settings.pue, "safety_min": settings.safety_min,
                                "threshold_pct": settings.threshold_pct, "threshold_g": settings.threshold_g,
                                "embodied_g": settings.embodied_g, "llm_enabled": settings.enable_llm}}
@@ -156,8 +164,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service, store, settings = workspace(request, "view")
         if request.state.assigned_project:
             project = request.state.assigned_project
+        view = request.state.view
+        allowed_zones = view.get("allowed_zones", [])
         with store.lock:
-            return [j for j in store.jobs() if not project or j.project == project]
+            return [j for j in store.jobs() if (not project or j.project == project) and (not allowed_zones or j.zone in allowed_zones)]
 
     @app.post("/api/jobs", status_code=201)
     def add_job(request: Request, data: JobInput):
@@ -169,10 +179,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/jobs/{job_id}/curve")
     def curve(request: Request, job_id: str):
         service, store, settings = workspace(request, "view")
+        view = request.state.view
+        allowed_zones = view.get("allowed_zones", [])
         with store.lock:
             job = service._job(job_id)
             if request.state.assigned_project and job.project != request.state.assigned_project:
                 raise HTTPException(403, "Access denied to this job")
+            if allowed_zones and job.zone not in allowed_zones:
+                raise HTTPException(403, "Access denied to jobs outside allowed zones")
             if job.decision:
                 return store.curve(job.decision)
             return service.curve_for(job)
@@ -187,8 +201,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service, store, settings = workspace(request, "view")
         if request.state.assigned_project:
             project = request.state.assigned_project
+        view = request.state.view
+        allowed_zones = view.get("allowed_zones", [])
         with store.lock:
-            return [j for j in store.jobs() if j.status == "needs_approval" and (not project or j.project == project)]
+            return [j for j in store.jobs() if j.status == "needs_approval" and (not project or j.project == project) and (not allowed_zones or j.zone in allowed_zones)]
 
     @app.post("/api/approvals/{job_id}")
     def review(request: Request, job_id: str, data: ApprovalInput):
@@ -224,6 +240,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service, store, settings = workspace(request, "view")
         if request.state.assigned_project:
             project = request.state.assigned_project
+        view = request.state.view
+        if "audit" not in view.get("visible_sections", []) or not view.get("show_decision_log", True):
+            return []
         with store.lock:
             entries = store.logs(None if all_runs else store.get("run_id"))
             return [e for e in entries if (not outcome or e["outcome"] == outcome)
@@ -232,6 +251,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/logs/{decision_id}/evidence")
     def evidence(request: Request, decision_id: int):
         service, store, settings = workspace(request, "view")
+        view = request.state.view
+        if "audit" not in view.get("visible_sections", []) or not view.get("show_decision_log", True):
+            raise HTTPException(403, "Decision log evidence is disabled for this project view")
         with store.lock:
             ev = store.evidence(decision_id)
             if request.state.assigned_project and ev.get("project", "default") != request.state.assigned_project:
@@ -243,6 +265,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service, store, settings = workspace(request, "view")
         if request.state.assigned_project:
             project = request.state.assigned_project
+        view = request.state.view
+        if "sensitivity" not in view.get("visible_sections", []) or not view.get("show_flexibility", True):
+            raise HTTPException(403, "Flexibility sensitivity analysis is disabled for this project view")
         return service.sensitivity(project)
 
     @app.get("/api/report")
@@ -250,6 +275,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service, store, settings = workspace(request, "view")
         if request.state.assigned_project:
             project = request.state.assigned_project
+        view = request.state.view
+        allowed_zones = view.get("allowed_zones", [])
+        if allowed_zones:
+            with store.lock:
+                jobs = [j for j in store.jobs() if (not project or j.project == project) and j.zone in allowed_zones]
+                return service.report_for(jobs)
         return service.report(project)
 
     @app.get("/api/report/export")
@@ -257,15 +288,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service, store, settings = workspace(request, "view")
         if request.state.assigned_project:
             project = request.state.assigned_project
+        view = request.state.view
+        if not view.get("allow_export", True):
+            raise HTTPException(403, "Report export is disabled for this project view")
         if format not in ("json", "csv") or scope not in ("current", "replay"):
             raise HTTPException(422, "Use format=json|csv and scope=current|replay")
+        allowed_zones = view.get("allowed_zones", [])
         with store.lock:
-            data = store.get("replay") if scope == "replay" else service.report(project)
+            if scope == "replay":
+                data = store.get("replay")
+            elif allowed_zones:
+                jobs = [j for j in store.jobs() if (not project or j.project == project) and j.zone in allowed_zones]
+                data = service.report_for(jobs)
+            else:
+                data = service.report(project)
         if data is None:
             raise Conflict("Run the seven-day replay first")
-        if request.state.assigned_project and scope == "replay":
+        if (request.state.assigned_project or allowed_zones) and scope == "replay":
             data = dict(data)
-            data["rows"] = [r for r in data["rows"] if r.get("project", "default") == request.state.assigned_project]
+            data["rows"] = [r for r in data["rows"]
+                            if (not request.state.assigned_project or r.get("project", "default") == request.state.assigned_project)
+                            and (not allowed_zones or r.get("zone") in allowed_zones)]
         if format == "json":
             return Response(json.dumps(data, indent=2), media_type="application/json",
                             headers={"Content-Disposition": f'attachment; filename="sci-{scope}.json"'})

@@ -39,6 +39,8 @@ class SchedulerService:
 
     def _bind(self, job: Job) -> Job:
         for key, value in self.store.get("scope", {}).items():
+            if key == "project" and getattr(job, "project", None):
+                continue
             setattr(job, key, value)
         return job
 

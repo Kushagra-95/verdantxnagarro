@@ -162,3 +162,143 @@ def test_client_consent_and_immediate_membership_revocation(scenario):
     grant = next(g for g in admin.get('/api/admin/directory').json()['memberships'] if g['user_id'] == uid)
     assert admin.delete('/api/admin/memberships/' + str(grant['id'])).status_code == 200
     assert viewer.get('/api/state', headers={'X-Environment-ID':scenario['ea']}).status_code == 404
+
+
+def test_viewer_cannot_edit_view_config(scenario):
+    admin = scenario['admin']
+    ca = scenario['accounts']['client_admin'][0]
+    operator = scenario['accounts']['project_operator'][0]
+    viewer = scenario['accounts']['viewer'][0]
+    pa, pb = scenario['pa'], scenario['pb']
+
+    body = {
+        'visible_sections': ['kpis', 'queue'],
+        'visible_kpis': ['avoided'],
+        'allowed_zones': ['DE'],
+        'show_decision_log': False,
+        'show_flexibility': False,
+        'allow_export': False,
+    }
+
+    # Viewer and project_operator cannot edit view config
+    assert viewer.put(f'/api/admin/projects/{pa}/view', json=body).status_code == 403
+    assert operator.put(f'/api/admin/projects/{pa}/view', json=body).status_code == 403
+
+    # Client admin of client A cannot edit project in client B
+    assert ca.put(f'/api/admin/projects/{pb}/view', json=body).status_code == 403
+
+    # Client admin of client A can edit own project
+    r = ca.put(f'/api/admin/projects/{pa}/view', json=body)
+    assert r.status_code == 200
+    saved = r.json()
+    assert saved['visible_sections'] == ['kpis', 'queue']
+    assert saved['visible_kpis'] == ['avoided']
+    assert saved['allowed_zones'] == ['DE']
+    assert saved['show_decision_log'] is False
+    assert saved['show_flexibility'] is False
+    assert saved['allow_export'] is False
+
+    # GET /admin/directory includes the view config
+    directory_data = admin.get('/api/admin/directory').json()
+    proj = next(p for p in directory_data['projects'] if p['id'] == pa)
+    assert proj['view']['visible_sections'] == ['kpis', 'queue']
+
+
+def test_hidden_sections_deny_or_strip_data_via_api(scenario):
+    ca = scenario['accounts']['client_admin'][0]
+    operator = scenario['accounts']['project_operator'][0]
+    pa, ea = scenario['pa'], scenario['ea']
+    headers = {'X-Environment-ID': ea}
+
+    # Populate jobs and a cycle
+    operator.post('/api/demo/reset', headers=headers).raise_for_status()
+    operator.post('/api/agent/cycle', headers=headers).raise_for_status()
+
+    # Hide audit, sensitivity, and disable export
+    ca.put(f'/api/admin/projects/{pa}/view', json={
+        'visible_sections': ['kpis', 'queue'],
+        'visible_kpis': ['avoided', 'reduction'],
+        'allowed_zones': [],
+        'show_decision_log': False,
+        'show_flexibility': False,
+        'allow_export': False,
+    }).raise_for_status()
+
+    # /api/state returns the resolved view config
+    st = operator.get('/api/state', headers=headers).json()
+    assert st['view']['visible_sections'] == ['kpis', 'queue']
+    assert st['view']['show_decision_log'] is False
+
+    # Hidden sensitivity -> /api/analysis/flexibility returns 403
+    assert operator.get('/api/analysis/flexibility', headers=headers).status_code == 403
+
+    # Disallowed export -> /api/report/export returns 403
+    assert operator.get('/api/report/export?format=csv', headers=headers).status_code == 403
+    assert operator.get('/api/report/export?format=json', headers=headers).status_code == 403
+
+    # Hidden audit -> /api/logs is stripped (empty list) and evidence returns 403
+    assert operator.get('/api/logs', headers=headers).json() == []
+    assert operator.get('/api/logs/1/evidence', headers=headers).status_code == 403
+
+
+def test_allowed_zones_filter_works(scenario):
+    ca = scenario['accounts']['client_admin'][0]
+    operator = scenario['accounts']['project_operator'][0]
+    pa, ea = scenario['pa'], scenario['ea']
+    headers = {'X-Environment-ID': ea}
+
+    operator.post('/api/demo/reset', headers=headers).raise_for_status()
+    operator.post('/api/agent/cycle', headers=headers).raise_for_status()
+
+    # Confirm initial demo has multiple zones
+    ca.put(f'/api/admin/projects/{pa}/view', json={
+        'visible_sections': ['kpis', 'queue', 'chart', 'rollups', 'audit', 'sensitivity'],
+        'visible_kpis': ['avoided', 'reduction', 'weekly', 'approvals'],
+        'allowed_zones': [],
+        'show_decision_log': True,
+        'show_flexibility': True,
+        'allow_export': True,
+    }).raise_for_status()
+    all_jobs = operator.get('/api/jobs', headers=headers).json()
+    assert len({j['zone'] for j in all_jobs}) > 1
+
+    # Now restrict to DE only
+    ca.put(f'/api/admin/projects/{pa}/view', json={
+        'visible_sections': ['kpis', 'queue', 'chart', 'rollups', 'audit', 'sensitivity'],
+        'visible_kpis': ['avoided', 'reduction', 'weekly', 'approvals'],
+        'allowed_zones': ['DE'],
+        'show_decision_log': True,
+        'show_flexibility': True,
+        'allow_export': True,
+    }).raise_for_status()
+
+    state = operator.get('/api/state', headers=headers).json()
+    assert all(j['zone'] == 'DE' for j in state['jobs'])
+    assert 'DE' in state['zones'] and len(state['zones']) == 1
+
+    jobs = operator.get('/api/jobs', headers=headers).json()
+    assert len(jobs) > 0
+    assert all(j['zone'] == 'DE' for j in jobs)
+
+    # Report and export are also filtered to allowed zone
+    report = operator.get('/api/report', headers=headers).json()
+    assert all(r['zone'] == 'DE' for r in report['rows'])
+    csv_text = operator.get('/api/report/export?format=csv', headers=headers).text
+    assert 'DE' in csv_text
+    assert 'US-CAL-CISO' not in csv_text
+
+    # Accessing curve of job outside allowed zone returns 403
+    non_de_job = next(j for j in all_jobs if j['zone'] != 'DE')
+    assert operator.get(f"/api/jobs/{non_de_job['id']}/curve", headers=headers).status_code == 403
+
+    # Reset allowed_zones to empty (all zones allowed)
+    ca.put(f'/api/admin/projects/{pa}/view', json={
+        'visible_sections': ['kpis', 'queue', 'chart', 'rollups', 'audit', 'sensitivity'],
+        'visible_kpis': ['avoided', 'reduction', 'weekly', 'approvals'],
+        'allowed_zones': [],
+        'show_decision_log': True,
+        'show_flexibility': True,
+        'allow_export': True,
+    }).raise_for_status()
+    restored_jobs = operator.get('/api/jobs', headers=headers).json()
+    assert len({j['zone'] for j in restored_jobs}) > 1

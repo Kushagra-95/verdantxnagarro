@@ -20,6 +20,19 @@ from app.store.sqlite import Store
 
 ROLES = {"platform_admin", "client_admin", "project_operator", "approver", "viewer"}
 DEFAULT_ENV = "env-default"
+ALL_SECTIONS = [
+    "kpis", "rollups", "chart", "spotlight", "sensitivity",
+    "queue", "approvals", "audit", "replay"
+]
+ALL_KPIS = ["avoided", "reduction", "weekly", "approvals"]
+DEFAULT_VIEW = {
+    "visible_sections": ALL_SECTIONS,
+    "visible_kpis": ALL_KPIS,
+    "allowed_zones": [],
+    "show_decision_log": True,
+    "show_flexibility": True,
+    "allow_export": True,
+}
 
 
 def password_hash(password: str, salt: str) -> str:
@@ -43,7 +56,7 @@ class Directory:
           display_name TEXT NOT NULL, salt TEXT NOT NULL, digest TEXT NOT NULL, platform_admin INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS tenants(id TEXT PRIMARY KEY, name TEXT NOT NULL, share_aggregate INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id),
-          name TEXT NOT NULL, threshold_pct REAL NOT NULL, threshold_g REAL NOT NULL, safety_min INTEGER NOT NULL);
+          name TEXT NOT NULL, threshold_pct REAL NOT NULL, threshold_g REAL NOT NULL, safety_min INTEGER NOT NULL, monthly_budget_g REAL);
         CREATE TABLE IF NOT EXISTS environments(id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
           name TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'synthetic');
         CREATE TABLE IF NOT EXISTS memberships(user_id TEXT REFERENCES users(id), tenant_id TEXT REFERENCES tenants(id),
@@ -57,7 +70,15 @@ class Directory:
           BEGIN SELECT RAISE(ABORT, 'Administration history is append-only'); END;
         CREATE TRIGGER IF NOT EXISTS admin_events_no_delete BEFORE DELETE ON admin_events
           BEGIN SELECT RAISE(ABORT, 'Administration history is append-only'); END;
+        CREATE TABLE IF NOT EXISTS project_views(project_id TEXT PRIMARY KEY REFERENCES projects(id),
+          visible_sections TEXT NOT NULL, visible_kpis TEXT NOT NULL, allowed_zones TEXT NOT NULL,
+          show_decision_log INTEGER NOT NULL, show_flexibility INTEGER NOT NULL, allow_export INTEGER NOT NULL,
+          updated_at REAL NOT NULL);
         """)
+        try:
+            self.db.execute("ALTER TABLE projects ADD COLUMN monthly_budget_g REAL")
+        except sqlite3.OperationalError:
+            pass
         self.db.commit()
         with self.transaction():
             if not self.db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
@@ -71,7 +92,7 @@ class Directory:
                     with os.fdopen(fd, "w", encoding="utf-8") as stream:
                         stream.write(f"Username: admin\nPassword: {password}\nChange the password after sign-in, then delete this file.\n")
             self.db.execute("INSERT OR IGNORE INTO tenants VALUES ('client-default','Local demo',0)")
-            self.db.execute("INSERT OR IGNORE INTO projects VALUES ('project-default','client-default','Default project',?,?,?)",
+            self.db.execute("INSERT OR IGNORE INTO projects VALUES ('project-default','client-default','Default project',?,?,?,NULL)",
                             (settings.threshold_pct, settings.threshold_g, settings.safety_min))
             self.db.execute("INSERT OR IGNORE INTO environments VALUES (?, 'project-default','Demo',?)",
                             (DEFAULT_ENV, settings.carbon_provider))
@@ -90,6 +111,46 @@ class Directory:
     def event(self, user: dict, action: str, target: str, details: dict) -> None:
         self.db.execute("INSERT INTO admin_events(recorded_at,user_id,action,target,details) VALUES(?,?,?,?,?)",
                         (time.time(), user["id"], action, target, json.dumps(details)))
+
+    def get_project_view(self, project_id: str) -> dict:
+        with self.lock:
+            row = self.db.execute("SELECT * FROM project_views WHERE project_id=?", (project_id,)).fetchone()
+            if not row:
+                return {
+                    "project_id": project_id,
+                    "visible_sections": list(ALL_SECTIONS),
+                    "visible_kpis": list(ALL_KPIS),
+                    "allowed_zones": [],
+                    "show_decision_log": True,
+                    "show_flexibility": True,
+                    "allow_export": True,
+                    "updated_at": 0.0,
+                }
+            return {
+                "project_id": row["project_id"],
+                "visible_sections": json.loads(row["visible_sections"]),
+                "visible_kpis": json.loads(row["visible_kpis"]),
+                "allowed_zones": json.loads(row["allowed_zones"]),
+                "show_decision_log": bool(row["show_decision_log"]),
+                "show_flexibility": bool(row["show_flexibility"]),
+                "allow_export": bool(row["allow_export"]),
+                "updated_at": float(row["updated_at"]),
+            }
+
+    def set_project_view(self, project_id: str, view: dict) -> dict:
+        now = time.time()
+        sections = json.dumps(view.get("visible_sections", ALL_SECTIONS))
+        kpis = json.dumps(view.get("visible_kpis", ALL_KPIS))
+        zones = json.dumps(view.get("allowed_zones", []))
+        log = int(bool(view.get("show_decision_log", True)))
+        flex = int(bool(view.get("show_flexibility", True)))
+        export = int(bool(view.get("allow_export", True)))
+        with self.lock:
+            self.db.execute(
+                "INSERT OR REPLACE INTO project_views VALUES (?,?,?,?,?,?,?,?)",
+                (project_id, sections, kpis, zones, log, flex, export, now),
+            )
+        return self.get_project_view(project_id)
 
     def create_user(self, username: str, name: str, password: str, platform_admin: bool = False) -> str:
         uid, salt = str(uuid4()), secrets.token_hex(16)
@@ -148,7 +209,7 @@ class Directory:
     def environments(self, user: dict) -> list[dict]:
         with self.lock:
             rows = [dict(r) for r in self.db.execute("""SELECT e.*,p.tenant_id,p.name project_name,t.name tenant_name,
-              p.threshold_pct,p.threshold_g,p.safety_min,t.share_aggregate FROM environments e
+              p.threshold_pct,p.threshold_g,p.safety_min,p.monthly_budget_g,t.share_aggregate FROM environments e
               JOIN projects p ON p.id=e.project_id JOIN tenants t ON t.id=p.tenant_id ORDER BY t.name,p.name,e.name""")]
             return [{**r, "roles": sorted(roles)} for r in rows
                     if (roles := self.membership(user, r["tenant_id"], r["project_id"]))]
@@ -185,12 +246,15 @@ class Directory:
                         store.set("clock", DEMO_START.isoformat())
                         store.set("run_id", str(uuid4()))
                         store.set("replay", None)
-                    store.set("scope", {"tenant_id": env["tenant_id"], "project_id": env["project_id"], "environment_id": env["id"]})
+                    store.set("scope", {"tenant_id": env["tenant_id"], "project_id": env["project_id"], "environment_id": env["id"],
+                                        "project": "default" if env["id"] == DEFAULT_ENV else env["project_name"]})
                 self.services[env["id"]] = SchedulerService(config, store)
                 # Add stable IDs to legacy mutable jobs; historical audit rows are never rewritten.
                 with store.transaction():
                     for job in store.jobs():
                         for key, value in store.get("scope").items():
+                            if key == "project" and getattr(job, "project", None):
+                                continue
                             setattr(job, key, value)
                         store.save(job)
             return self.services[env["id"]]

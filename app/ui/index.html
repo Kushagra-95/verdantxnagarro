@@ -31,7 +31,7 @@
     <div class="topbar-right"><span class="clock-label">DEMO CLOCK</span><time id="clock">Connecting…</time><span class="avatar">DP</span></div>
   </header>
   <main id="overview">
-    <section class="workspace-switcher notice"><label for="environment-select">Client / project / environment</label><select id="environment-select" aria-label="Client project environment"></select><span id="signed-in-user"></span></section>
+    <section class="workspace-switcher notice"><label for="environment-select">Client / project / environment</label><select id="environment-select" aria-label="Client project environment"></select><span id="signed-in-user"></span><span id="custom-view-badge" class="badge neutral" hidden></span></section>
     <section class="hero"><div><div class="eyebrow"><span class="tiny-dot"></span> CARBON-AWARE BATCH SCHEDULER</div>
       <h1>A greener window.<br><span>The same deadline.</span></h1>
       <p>Put flexible workloads where the grid is cleaner.<br>Let your team decide when the stakes are higher.</p></div>
@@ -41,22 +41,29 @@
     </section>
     <div class="notice"><span class="badge simulated" id="source-badge">SIMULATED</span><p id="source-note">Seeded grid data · no API key needed · all savings are modeled estimates.</p><span class="notice-detail">R = one job run</span></div>
     <div class="toolbar"><label for="project-filter">Workload group filter</label><select id="project-filter"><option value="">All groups</option></select><span class="toolbar-note">SIMULATED WORKLOAD · scoped access</span></div>
-    <section class="kpis" aria-label="Carbon performance">
-      <article class="kpi featured"><div class="kpi-label">Estimated CO₂e avoided <span>↘</span></div><div class="kpi-value"><span id="avoided">0</span><small>g</small></div><p id="included-note">Run the agent to compare schedules</p><span class="kpi-source source-text">SIMULATED</span></article>
-      <article class="kpi"><div class="kpi-label">Carbon reduction <span>◎</span></div><div class="kpi-value"><span id="reduction">0</span><small>%</small></div><p>Against fixed 14:00 local scheduling</p><span class="kpi-source source-text">SIMULATED</span></article>
-      <article class="kpi"><div class="kpi-label">Weekly projection <span>↗</span></div><div class="kpi-value"><span id="weekly">0</span><small>g</small></div><p>Applied workload × 7 days <button class="text-button" id="replay-inline">Verify in replay ↗</button></p><span class="kpi-source source-text">SIMULATED</span></article>
-      <article class="kpi"><div class="kpi-label">Awaiting your decision <span>◇</span></div><div class="kpi-value" id="approval-count">0</div><p>Protected jobs stay in your hands</p><a href="#approvals" class="text-link">Open approval inbox →</a></article>
+    <section class="kpis" id="kpis-section" aria-label="Carbon performance">
+      <article class="kpi featured" data-kpi="avoided"><div class="kpi-label">Estimated CO₂e avoided <span>↘</span></div><div class="kpi-value"><span id="avoided">0</span><small>g</small></div><p id="included-note">Run the agent to compare schedules</p><span class="kpi-source source-text">SIMULATED</span></article>
+      <article class="kpi" data-kpi="reduction"><div class="kpi-label">Carbon reduction <span>◎</span></div><div class="kpi-value"><span id="reduction">0</span><small>%</small></div><p>Against fixed 14:00 local scheduling</p><span class="kpi-source source-text">SIMULATED</span></article>
+      <article class="kpi" data-kpi="weekly"><div class="kpi-label">Weekly projection <span>↗</span></div><div class="kpi-value"><span id="weekly">0</span><small>g</small></div><p>Applied workload × 7 days <button class="text-button" id="replay-inline">Verify in replay ↗</button></p><span class="kpi-source source-text">SIMULATED</span></article>
+      <article class="kpi" data-kpi="approvals"><div class="kpi-label">Awaiting your decision <span>◇</span></div><div class="kpi-value" id="approval-count">0</div><p>Protected jobs stay in your hands</p><a href="#approvals" class="text-link">Open approval inbox →</a></article>
     </section>
-    <section class="panel section-panel"><div class="panel-heading"><div><h2>Workload group modeled savings</h2><p>Applied schedules only · SIMULATED WORKLOAD</p></div></div><div class="table-scroll"><table><thead><tr><th>Workload group</th><th>Applied / total</th><th>Modeled savings (g)</th><th>Reduction</th><th>Source</th></tr></thead><tbody id="project-rollups"></tbody></table></div></section>
-    <section class="insight-grid">
-      <article class="panel chart-panel"><div class="panel-heading"><div><h2>Find the cleaner window</h2><p id="chart-subtitle">Select a job to explore grid carbon intensity</p></div><span id="chart-source" class="badge simulated">SIMULATED</span></div>
+    <section id="budget-section" class="panel section-panel" hidden>
+      <div class="panel-heading"><div><h2>Carbon budget</h2><p>Applied schedules only · <span class="badge simulated" style="display:inline-block; padding: 2px 6px; font-size: 10px;">SIMULATED</span></p></div><span id="budget-status" style="font-weight: bold;"></span></div>
+      <div style="background: var(--line); border-radius: 4px; height: 12px; margin-top: 10px; overflow: hidden;">
+        <div id="budget-bar" style="height: 100%; transition: width 0.3s, background-color 0.3s; width: 0%;"></div>
+      </div>
+    </section>
+    <section id="rollups-section" class="panel section-panel"><div class="panel-heading"><div><h2>Workload group modeled savings</h2><p>Applied schedules only · SIMULATED WORKLOAD</p></div></div><div class="table-scroll"><table><thead><tr><th>Workload group</th><th>Applied / total</th><th>Modeled savings (g)</th><th>Reduction</th><th>Source</th></tr></thead><tbody id="project-rollups"></tbody></table></div></section>
+    <section id="opportunities-section" class="panel section-panel" hidden><div class="panel-heading"><div><h2>Top opportunities</h2><p>Flexible jobs not yet moved · <span class="badge simulated" style="display:inline-block; padding: 2px 6px; font-size: 10px;">SIMULATED</span></p></div></div><div class="table-scroll"><table><thead><tr><th>Job</th><th>Potential savings (g)</th><th></th></tr></thead><tbody id="opportunities-list"></tbody></table></div></section>
+    <section class="insight-grid" id="insight-grid">
+      <article class="panel chart-panel" id="chart-section"><div class="panel-heading"><div><h2>Find the cleaner window</h2><p id="chart-subtitle">Select a job to explore grid carbon intensity</p></div><span id="chart-source" class="badge simulated">SIMULATED</span></div>
         <div class="chart-legend"><span><i class="legend-line green"></i>Grid intensity</span><span><i class="legend-line amber"></i>14:00 baseline</span><span><i class="legend-line white"></i>Chosen window</span></div>
         <div id="chart" class="chart" aria-live="polite"><p class="empty">Loading intensity curve…</p></div>
         <div class="chart-footer"><span>g CO₂e / kWh · zone local time</span><span id="chart-reason">Seeded 48-hour forecast</span></div>
       </article>
-      <article class="panel selected-panel"><div class="panel-heading"><h2>Decision spotlight</h2><span class="tiny-dot"></span></div><div id="spotlight"><p class="empty">Select a job below.</p></div></article>
+      <article class="panel selected-panel" id="spotlight-section"><div class="panel-heading"><h2>Decision spotlight</h2><span class="tiny-dot"></span></div><div id="spotlight"><p class="empty">Select a job below.</p></div></article>
     </section>
-    <section class="panel section-panel"><div class="panel-heading"><div><h2>Flexibility sensitivity</h2><p>Hypothetical modeled savings, separate from applied totals. SIMULATED WORKLOAD.</p></div><button id="sensitivity-run" class="secondary">Analyze flexibility</button></div><div id="sensitivity-result" class="analysis-content"><p>Compare start windows of +/-1, 2, 4 and 8 hours around the original 14:00 local baseline, clipped to existing constraints.</p></div></section>
+    <section id="sensitivity-section" class="panel section-panel"><div class="panel-heading"><div><h2>Flexibility sensitivity</h2><p>Hypothetical modeled savings, separate from applied totals. SIMULATED WORKLOAD.</p></div><button id="sensitivity-run" class="secondary">Analyze flexibility</button></div><div id="sensitivity-result" class="analysis-content"><p>Compare start windows of +/-1, 2, 4 and 8 hours around the original 14:00 local baseline, clipped to existing constraints.</p></div></section>
     <section id="queue" class="panel section-panel">
       <div class="panel-heading"><div><div class="section-eyebrow">THE WORKLOAD</div><h2>Job queue <span id="queue-count" class="count">25</span></h2><p>Choose a row to inspect its carbon curve and scheduling rationale.</p></div><button id="add-job" class="secondary">＋ Add job</button></div>
       <div class="toolbar"><input id="job-search" type="search" aria-label="Search jobs" placeholder="Search jobs or owners…"><select id="status-filter" aria-label="Filter status"><option value="">All statuses</option><option>pending</option><option>scheduled</option><option value="needs_approval">needs approval</option><option>approved</option><option>rejected</option><option>completed</option></select><select id="zone-filter" aria-label="Filter zone"><option value="">All zones</option><option>DE</option><option>US-CAL-CISO</option><option>IN-WE</option><option>GB</option></select><span class="toolbar-note">Times shown in each job’s zone</span></div>

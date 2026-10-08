@@ -51,6 +51,12 @@ async function refresh() {
   $('#project-rollups').innerHTML = r.projects.map(p => `<tr><td>${esc(p.project)}</td><td>${p.included_jobs} / ${p.total_jobs}</td><td>${num(p.avoided_g)}</td><td>${num(p.reduction_pct,1)}%</td><td>${badge(p.source)}</td></tr>`).join('');
   $('#clock').textContent = `${when(state.clock, 'UTC', true)} UTC`;
   $('#avoided').textContent = num(r.avoided_g);
+  
+  const co2_km = (r.avoided_g / 120).toFixed(1);
+  const co2_phones = Math.round(r.avoided_g / 8);
+  const co2El = document.getElementById('co2-equivalents');
+  if (co2El) co2El.textContent = `≈ ${co2_km} km driven · ${co2_phones} phone charges (illustrative, modeled)`;
+
   $('#reduction').textContent = num(r.reduction_pct, 1);
   $('#weekly').textContent = num(r.projected_weekly_g);
   $('#approval-count').textContent = state.pending_approvals;
@@ -58,13 +64,151 @@ async function refresh() {
   $('#queue-count').textContent = state.jobs.length;
   $('#nav-approvals').textContent = state.pending_approvals;
   $('#inbox-count').textContent = state.pending_approvals;
+  
+  const budget = state.workspace?.monthly_budget_g;
+  const budgetSec = $('#budget-section');
+  if (budgetSec) {
+    if (budget != null) {
+      budgetSec.hidden = false;
+      const rawPct = (r.scheduled_g / budget) * 100;
+      const clampedPct = Math.min(100, Math.max(0, rawPct));
+      $('#budget-bar').style.width = clampedPct + '%';
+      $('#budget-bar').style.backgroundColor = (rawPct < 80) ? 'var(--green)' : ((rawPct <= 100) ? 'var(--amber)' : 'var(--red)');
+      $('#budget-status').textContent = `${num(r.scheduled_g)} g / ${num(budget)} g (${num(rawPct, 1)}%)`;
+    } else {
+      budgetSec.hidden = true;
+    }
+  }
+
+  const oppSec = $('#opportunities-section');
+  if (oppSec) {
+    try {
+      const result = await api(`/api/analysis/flexibility?${new URLSearchParams({project})}`);
+      const pt8 = result.points.find(p => p.flexibility_hours === 8) || result.points[result.points.length - 1];
+      const candidates = pt8.rows
+        .filter(row => row.included && row.modeled_saving_g > 0)
+        .filter(row => {
+          const j = state.jobs.find(x => x.id === row.job_id);
+          return j && j.status === 'pending';
+        })
+        .sort((a, b) => b.modeled_saving_g - a.modeled_saving_g)
+        .slice(0, 3);
+      
+      const tbody = $('#opportunities-list');
+      if (candidates.length) {
+        tbody.innerHTML = candidates.map(c => {
+          const j = state.jobs.find(x => x.id === c.job_id);
+          return `<tr><td>${esc(j?.name || c.job_id)}</td><td>${num(c.modeled_saving_g)}</td><td><button class="text-button opp-select" data-id="${esc(c.job_id)}">Select job →</button></td></tr>`;
+        }).join('');
+        document.querySelectorAll('.opp-select').forEach(btn => btn.addEventListener('click', async (e) => {
+          const id = e.target.dataset.id;
+          selectedId = id;
+          renderJobs();
+          renderSpotlight();
+          await renderChart();
+          document.getElementById('chart-section').scrollIntoView({behavior: 'smooth'});
+        }));
+        oppSec.hidden = false;
+      } else {
+        tbody.innerHTML = `<tr><td colspan="3" class="muted">No pending flexible jobs with modeled savings.</td></tr>`;
+        oppSec.hidden = false; // or true if you want to hide it entirely
+      }
+    } catch(e) {
+      // e.g. 403 if sensitivity hidden
+      oppSec.hidden = true;
+    }
+  }
   $('#included-note').textContent = `${r.included_jobs} applied schedules · ${r.excluded_jobs} excluded`;
   document.querySelectorAll('.source-text').forEach(el => {el.textContent = r.source;});
   $('#source-badge').textContent = r.source;
   $('#source-badge').className = `badge ${r.source === 'LIVE' ? 'live' : 'simulated'}`;
   $('#source-note').textContent = r.sources.length > 1 ? 'Mixed carbon sources across jobs; inspect each source label. All savings are modeled.' : r.source === 'LIVE' ? 'API-sourced estimates and forecasts · savings are modeled, not measured.' : r.source.includes('RECORDED') ? 'Recorded historical grid estimates · original dates · modeled savings, not measured emissions.' : r.source.includes('LIVE') ? 'Mixed sources across jobs · each job is labeled individually · all savings are modeled.' : 'Seeded grid data · no API key needed · all savings are modeled estimates.';
   renderJobs(); renderApprovals(); renderSpotlight();
-  await Promise.all([renderChart(), renderLogs()]); applyPermissions();
+  applyViewConfig(state.view);
+  const tasks = [];
+  if (!state.view || state.view.visible_sections.includes('chart')) tasks.push(renderChart());
+  if (!state.view || (state.view.visible_sections.includes('audit') && state.view.show_decision_log !== false)) tasks.push(renderLogs());
+  await Promise.all(tasks); applyPermissions();
+}
+function applyViewConfig(view) {
+  if (!view) return;
+  const sections = view.visible_sections || [];
+  const kpis = view.visible_kpis || [];
+  const allowedZones = view.allowed_zones || [];
+  const showLog = view.show_decision_log !== false && sections.includes('audit');
+  const showFlex = view.show_flexibility !== false && sections.includes('sensitivity');
+  const allowExport = view.allow_export !== false;
+
+  const customBadge = $('#custom-view-badge');
+  if (customBadge && state?.workspace?.project_name) {
+    customBadge.textContent = `Custom view for ${state.workspace.project_name}`;
+    customBadge.hidden = false;
+  }
+
+  const secMap = {
+    'kpis': $('#kpis-section'),
+    'rollups': $('#rollups-section'),
+    'chart': $('#chart-section'),
+    'spotlight': $('#spotlight-section'),
+    'sensitivity': $('#sensitivity-section'),
+    'queue': $('#queue'),
+    'approvals': $('#approvals'),
+    'audit': $('#audit'),
+  };
+  for (const [key, el] of Object.entries(secMap)) {
+    if (el) {
+      if (key === 'audit') el.hidden = !showLog;
+      else if (key === 'sensitivity') el.hidden = !showFlex;
+      else el.hidden = !sections.includes(key);
+    }
+  }
+
+  const chartVisible = sections.includes('chart');
+  const spotVisible = sections.includes('spotlight');
+  if ($('#insight-grid')) $('#insight-grid').hidden = !chartVisible && !spotVisible;
+
+  const replayVisible = sections.includes('replay');
+  ['#replay', '#replay-inline', '#nav-replay'].forEach(sel => {
+    const el = $(sel); if (el) el.hidden = !replayVisible;
+  });
+
+  const navMap = {
+    'queue': $('a[href="#queue"]'),
+    'approvals': $('a[href="#approvals"]'),
+    'audit': $('a[href="#audit"]'),
+    'replay': $('#nav-replay'),
+  };
+  for (const [key, el] of Object.entries(navMap)) {
+    if (el) {
+      if (key === 'audit') el.hidden = !showLog;
+      else if (key === 'replay') el.hidden = !replayVisible;
+      else el.hidden = !sections.includes(key);
+    }
+  }
+
+  document.querySelectorAll('[data-kpi]').forEach(card => {
+    card.hidden = !kpis.includes(card.dataset.kpi);
+  });
+
+  const filterSelect = $('#zone-filter');
+  if (filterSelect) {
+    [...filterSelect.options].forEach(opt => {
+      if (!opt.value) return;
+      opt.hidden = allowedZones.length > 0 && !allowedZones.includes(opt.value);
+    });
+    if (allowedZones.length > 0 && !allowedZones.includes(filterSelect.value)) filterSelect.value = '';
+  }
+  const jobZoneSelect = $('#job-form select[name="zone"]');
+  if (jobZoneSelect) {
+    [...jobZoneSelect.options].forEach(opt => {
+      opt.hidden = allowedZones.length > 0 && !allowedZones.includes(opt.value);
+    });
+    if (allowedZones.length > 0 && !allowedZones.includes(jobZoneSelect.value)) jobZoneSelect.value = allowedZones[0];
+  }
+
+  document.querySelectorAll('a[href*="/api/report/export"]').forEach(a => {
+    a.hidden = !allowExport;
+  });
 }
 function renderJobs() {
   const search = $('#job-search').value.toLowerCase();

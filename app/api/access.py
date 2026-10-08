@@ -10,13 +10,31 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.access import Directory, password_hash
+from app.access import Directory, password_hash, ALL_SECTIONS, ALL_KPIS
 
 Role = Literal["client_admin", "project_operator", "approver", "viewer"]
+SectionKey = Literal["kpis", "rollups", "chart", "spotlight", "sensitivity", "queue", "approvals", "audit", "replay"]
+KPIKey = Literal["avoided", "reduction", "weekly", "approvals"]
 
 
 class Input(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, allow_inf_nan=False)
+
+
+class ProjectViewInput(Input):
+    visible_sections: list[SectionKey] = Field(default_factory=lambda: list(ALL_SECTIONS))
+    visible_kpis: list[KPIKey] = Field(default_factory=lambda: list(ALL_KPIS))
+    allowed_zones: list[str] = Field(default_factory=list)
+    show_decision_log: bool = True
+    show_flexibility: bool = True
+    allow_export: bool = True
+
+    @model_validator(mode="after")
+    def deduplicate(self):
+        self.visible_sections = list(dict.fromkeys(self.visible_sections))
+        self.visible_kpis = list(dict.fromkeys(self.visible_kpis))
+        self.allowed_zones = list(dict.fromkeys(self.allowed_zones))
+        return self
 
 
 class Login(Input):
@@ -48,6 +66,7 @@ class Policy(Input):
     threshold_pct: float = Field(ge=0, le=100)
     threshold_g: float = Field(ge=0)
     safety_min: int = Field(ge=0, le=240)
+    monthly_budget_g: float | None = Field(default=None, ge=0)
 
 
 class Consent(Input):
@@ -135,7 +154,7 @@ def access_router(directory: Directory) -> APIRouter:
             if not tids:
                 return {"tenants": [], "projects": [], "environments": [], "memberships": []}
             tenants = [dict(r) for r in directory.db.execute("SELECT * FROM tenants") if r["id"] in tids]
-            projects = [dict(r) for r in directory.db.execute("SELECT * FROM projects") if r["tenant_id"] in tids]
+            projects = [{**dict(r), "view": directory.get_project_view(r["id"])} for r in directory.db.execute("SELECT * FROM projects") if r["tenant_id"] in tids]
             environments = [{**e, "credential_variable": directory.credential_name(e["id"]),
                              "credential_configured": bool(os.getenv(directory.credential_name(e["id"]))) or (e["id"] == "env-default" and bool(directory.settings.electricity_token))}
                             for e in directory.environments(user) if e["tenant_id"] in tids]
@@ -160,7 +179,7 @@ def access_router(directory: Directory) -> APIRouter:
             if not directory.db.execute("SELECT 1 FROM tenants WHERE id=?", (data.tenant_id,)).fetchone():
                 raise HTTPException(404, "Client not found")
             s = directory.settings
-            directory.db.execute("INSERT INTO projects VALUES (?,?,?,?,?,?)", (pid, data.tenant_id, data.name, s.threshold_pct, s.threshold_g, s.safety_min))
+            directory.db.execute("INSERT INTO projects VALUES (?,?,?,?,?,?,?)", (pid, data.tenant_id, data.name, s.threshold_pct, s.threshold_g, s.safety_min, None))
             directory.event(request.state.user, "PROJECT_CREATED", pid, data.model_dump())
         return {"id": pid, **data.model_dump()}
 
@@ -183,10 +202,18 @@ def access_router(directory: Directory) -> APIRouter:
             raise HTTPException(422, "Project policy cannot weaken platform savings thresholds or SLA buffer")
         with directory.transaction():
             project_admin(request.state.user, project_id)
-            directory.db.execute("UPDATE projects SET threshold_pct=?,threshold_g=?,safety_min=? WHERE id=?", (data.threshold_pct, data.threshold_g, data.safety_min, project_id))
+            directory.db.execute("UPDATE projects SET threshold_pct=?,threshold_g=?,safety_min=?,monthly_budget_g=? WHERE id=?", (data.threshold_pct, data.threshold_g, data.safety_min, data.monthly_budget_g, project_id))
             directory.event(request.state.user, "POLICY_CHANGED", project_id, data.model_dump())
             directory.invalidate(project_id)
         return data
+
+    @router.put("/admin/projects/{project_id}/view")
+    def project_view(project_id: str, data: ProjectViewInput, request: Request):
+        with directory.transaction():
+            project_admin(request.state.user, project_id)
+            updated = directory.set_project_view(project_id, data.model_dump())
+            directory.event(request.state.user, "PROJECT_VIEW_CHANGED", project_id, data.model_dump())
+        return updated
 
     @router.put("/admin/environments/{environment_id}/provider")
     def provider(environment_id: str, data: Environment, request: Request):
